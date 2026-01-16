@@ -1,0 +1,250 @@
+name: RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_name:
+        description: 'Name for this RDP session'
+        required: true
+        default: 'github-rdp'
+      timeout_minutes:
+        description: 'Session timeout in minutes (max 360)'
+        required: true
+        default: '60'
+        type: number
+
+permissions:
+  contents: write
+
+env:
+  RDP_USER: github-rdp-user
+  TAILSCALE_HOSTNAME: github-rdp-${{ github.run_id }}
+
+jobs:
+  setup-rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Windows RDP
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Configure for Tailscale access
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null || echo "No existing rule found"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          # Restart RDP service
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+      - name: Generate Secure RDP Password
+        id: rdp_password
+        run: |
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(24, 6)
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name "$env:RDP_USER" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:RDP_USER"
+          
+          # Store password in output
+          echo "rdp-password=$password" >> $env:GITHUB_OUTPUT
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "$env:RDP_USER")) {
+              Write-Error "Failed to create RDP user"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Connect to Tailscale
+        id: tailscale
+        run: |
+          # Authenticate with Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TAILSCALE_HOSTNAME --accept-routes
+          
+          # Get Tailscale IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 2
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP after $retries retries"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              exit 1
+          }
+          
+          echo "tailscale-ip=$tsIP" >> $env:GITHUB_OUTPUT
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Connection
+        run: |
+          Write-Host "Testing RDP connectivity to Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Small retry loop for connectivity test
+          $maxRetries = 10
+          $retryCount = 0
+          $connected = $false
+          
+          while (-not $connected -and $retryCount -lt $maxRetries) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+              if ($testResult.TcpTestSucceeded) {
+                  $connected = $true
+                  Write-Host "✅ RDP connection successful!"
+              } else {
+                  $retryCount++
+                  Write-Host "Attempt $retryCount/$maxRetries: Waiting for RDP to become available..."
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
+          if (-not $connected) {
+              Write-Error "❌ RDP connection test failed after $maxRetries attempts"
+              exit 1
+          }
+
+      - name: Save Connection Details
+        run: |
+          $connectionDetails = @"
+# RDP Connection Details
+## Session: ${{ github.event.inputs.session_name }}
+## Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+## Expires: $(Get-Date).AddMinutes(${{ github.event.inputs.timeout_minutes }}) -Format 'yyyy-MM-dd HH:mm:ss')
+
+## Connection Information:
+- **Tailscale IP:** ${{ steps.tailscale.outputs.tailscale-ip }}
+- **Username:** ${{ env.RDP_USER }}
+- **Password:** ${{ steps.rdp_password.outputs.rdp-password }}
+- **Hostname:** ${{ env.TAILSCALE_HOSTNAME }}
+
+## Instructions:
+1. Connect to Tailscale VPN
+2. Open Remote Desktop Connection (mstsc.exe)
+3. Enter the Tailscale IP above
+4. Use the credentials provided
+
+## Notes:
+- This session will automatically terminate after ${{ github.event.inputs.timeout_minutes }} minutes
+- Ensure Tailscale is running on your local machine
+- The password is one-time use only for this session
+
+**⚠️ Security Warning:**
+- This RDP session is only accessible via Tailscale VPN
+- The runner will be destroyed after timeout
+- Credentials are invalidated after session ends
+"@
+          
+          # Save to file
+          $connectionDetails | Out-File -FilePath "$env:GITHUB_WORKSPACE\RDP_CONNECTION.md" -Encoding UTF8
+          
+          # Also output to workflow summary
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $connectionDetails
+
+      - name: Upload Connection Details
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-info
+          path: |
+            RDP_CONNECTION.md
+          retention-days: 1
+
+      - name: Display Connection Details
+        run: |
+          Write-Host "=============================================="
+          Write-Host "           RDP SESSION READY                  "
+          Write-Host "=============================================="
+          Write-Host "Session Name: ${{ github.event.inputs.session_name }}"
+          Write-Host "Tailscale IP: ${{ steps.tailscale.outputs.tailscale-ip }}"
+          Write-Host "Username: ${{ env.RDP_USER }}"
+          Write-Host "Password: ${{ steps.rdp_password.outputs.rdp-password }}"
+          Write-Host ""
+          Write-Host "Session will expire in ${{ github.event.inputs.timeout_minutes }} minutes"
+          Write-Host "=============================================="
+          
+          # Save credentials temporarily for the wait step (they'll be cleared automatically)
+          echo "RDP_IP=${{ steps.tailscale.outputs.tailscale-ip }}" >> $env:GITHUB_ENV
+          echo "RDP_USER=${{ env.RDP_USER }}" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=${{ steps.rdp_password.outputs.rdp-password }}" >> $env:GITHUB_ENV
+
+      - name: Keep Session Alive
+        run: |
+          $timeoutMinutes = ${{ github.event.inputs.timeout_minutes }}
+          $startTime = Get-Date
+          $endTime = $startTime.AddMinutes($timeoutMinutes)
+          
+          Write-Host "Session started at: $($startTime.ToString('HH:mm:ss'))"
+          Write-Host "Session will end at: $($endTime.ToString('HH:mm:ss'))"
+          Write-Host ""
+          Write-Host "Current Connection Details:"
+          Write-Host "IP: $env:RDP_IP"
+          Write-Host "User: $env:RDP_USER"
+          Write-Host ""
+          
+          # Clear sensitive environment variables after displaying
+          Remove-Item Env:RDP_PASSWORD -ErrorAction SilentlyContinue
+          
+          while ((Get-Date) -lt $endTime) {
+              $remaining = $endTime - (Get-Date)
+              $minutesRemaining = [math]::Ceiling($remaining.TotalMinutes)
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $minutesRemaining minute(s) remaining"
+              Write-Host "Use the RDP_CONNECTION.md file or workflow summary for credentials"
+              Write-Host ""
+              
+              if ($minutesRemaining -le 5) {
+                  Write-Host "⚠️  Warning: Session ending in $minutesRemaining minute(s)"
+              }
+              
+              Start-Sleep -Seconds 60
+          }
+          
+          Write-Host "Session timeout reached. Shutting down..."
+
+      - name: Cleanup on Completion
+        if: always()
+        run: |
+          Write-Host "Performing cleanup..."
+          
+          # Remove RDP user
+          try {
+              Remove-LocalUser -Name "$env:RDP_USER" -ErrorAction SilentlyContinue
+              Write-Host "✓ RDP user removed"
+          } catch {
+              Write-Host "⚠️  Could not remove RDP user"
+          }
+          
+          # Disconnect Tailscale
+          try {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+              Write-Host "✓ Tailscale disconnected"
+          } catch {
+              Write-Host "⚠️  Could not disconnect Tailscale"
+          }
+          
+          Write-Host "Cleanup complete"
