@@ -1,10 +1,7 @@
-name: RDP
+name: RDP via Tailscale
 
 on:
   workflow_dispatch:
-
-env:
-  TAILSCALE_AUTH_KEY: tskey-auth-kNMhFQaRjM11CNTRL-816V8R5eNoYGGf1NzmEhnYKZvWPn7uoJ
 
 jobs:
   secure-rdp:
@@ -62,7 +59,7 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
@@ -70,9 +67,11 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ env.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
@@ -106,7 +105,7 @@ jobs:
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: $(echo $env:RDP_CREDS | Select-String -Pattern 'Password:\s*(.+)' | ForEach-Object {$_.Matches.Groups[1].Value})"
           Write-Host "==================`n"
           
           # Keep runner active indefinitely (or until manually cancelled)
